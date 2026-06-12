@@ -1,0 +1,52 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node>
+  <interface name="org.vantagex.daemon">
+    <!-- Battery Thresholds -->
+    <method name="GetChargeStartThreshold">
+      <arg type="i" name="threshold" direction="out"/>
+    </method>
+    <method name="SetChargeStartThreshold">
+      <arg type="i" name="threshold" direction="in"/>
+    </method>
+    <method name="GetChargeEndThreshold">
+      <arg type="i" name="threshold" direction="out"/>
+    </method>
+    <method name="SetChargeEndThreshold">
+      <arg type="i" name="threshold" direction="in"/>
+    </method>
+
+    <!-- Pen Status -->
+    <method name="GetPenPercentage">
+      <arg type="i" name="percentage" direction="out"/>
+    </method>
+
+    <!-- Power Profiles Proxy -->
+    <method name="GetActiveProfile">
+      <arg type="s" name="profile" direction="out"/>
+    </method>
+    <method name="SetActiveProfile">
+      <arg type="s" name="profile" direction="in"/>
+    </method>
+
+    <!-- Miracast Stubs -->
+    <method name="ScanMiracast">
+      <arg type="as" name="devices" direction="out"/>
+    </method>
+    <method name="ConnectMiracast">
+      <arg type="s" name="target_mac" direction="in"/>
+      <arg type="b" name="success" direction="out"/>
+    </method>
+
+    <!-- Signals -->
+    <signal name="PenPercentageChanged">
+      <arg type="i" name="percentage"/>
+    </signal>
+    <signal name="PowerProfileChanged">
+      <arg type="s" name="profile"/>
+    </signal>
+    <signal name="TabletModeChanged">
+      <arg type="b" name="is_tablet_mode"/>
+    </signal>
+  </interface>
+</node>
