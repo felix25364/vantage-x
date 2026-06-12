@@ -1,221 +1,114 @@
 #!/usr/bin/env python3
+import sys
 import asyncio
-import glob
-import os
 import signal
+from PyQt6.QtGui import QGuiApplication
+from PyQt6.QtQml import QQmlApplicationEngine
+from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from qasync import QEventLoop
 from dbus_next.aio import MessageBus
-from dbus_next.service import ServiceInterface, method, signal as dbus_signal
-from dbus_next.message import Message, MessageType
-import evdev
-from evdev import ecodes
 
-class VantageXDaemon(ServiceInterface):
-    def __init__(self, name):
-        super().__init__(name)
-        self.tablet_mode = False
-        self.grabbed_devices = []
+class DBusBackend(QObject):
+    # Signale an QML, um die Oberfläche zu aktualisieren
+    chargeStartUpdated = pyqtSignal(int, arguments=['threshold'])
+    chargeEndUpdated = pyqtSignal(int, arguments=['threshold'])
+    penPercentageUpdated = pyqtSignal(int, arguments=['percentage'])
+    powerProfileUpdated = pyqtSignal(str, arguments=['profile'])
 
-    def _get_battery_path(self):
-        # Dynamically find the primary battery
-        paths = glob.glob('/sys/class/power_supply/BAT*')
-        if paths:
-            return paths[0]
-        return None
+    def __init__(self):
+        super().__init__()
+        self.bus = None
+        self.proxy_interface = None
 
-    def _read_sysfs_int(self, path):
+    async def init_dbus(self):
         try:
-            with open(path, 'r') as f:
-                return int(f.read().strip())
-        except (FileNotFoundError, ValueError):
-            return -1
+            # Verbindung zum System Bus (wo der Daemon läuft)
+            self.bus = await MessageBus(bus_type=0).connect()
+            
+            # Introspektion und Proxy-Objekt holen
+            introspection = await self.bus.introspect('org.vantagex.daemon', '/org/vantagex/daemon')
+            proxy_object = self.bus.get_proxy_object('org.vantagex.daemon', '/org/vantagex/daemon', introspection)
+            self.proxy_interface = proxy_object.get_interface('org.vantagex.daemon')
 
-    def _write_sysfs_int(self, path, value):
+            # Initiale Werte abfragen und an QML senden
+            start = await self.proxy_interface.call_get_charge_start_threshold()
+            end = await self.proxy_interface.call_get_charge_end_threshold()
+            pen = await self.proxy_interface.call_get_pen_percentage()
+            profile = await self.proxy_interface.call_get_active_profile()
+
+            self.chargeStartUpdated.emit(start)
+            self.chargeEndUpdated.emit(end)
+            self.penPercentageUpdated.emit(pen)
+            self.powerProfileUpdated.emit(profile)
+
+            # Auf D-Bus-Signale vom Daemon horchen
+            self.proxy_interface.on_pen_percentage_changed(self.penPercentageUpdated.emit)
+            self.proxy_interface.on_power_profile_changed(self.powerProfileUpdated.emit)
+            # Falls benötigt, könnte hier auch TabletMode überwacht werden
+
+        except Exception as e:
+            print(f"Fehler bei der D-Bus Initialisierung: {e}", file=sys.stderr)
+
+    # Slots, die von QML aufgerufen werden (z.B. durch Slider/Buttons)
+    @pyqtSlot(int)
+    def setChargeStartThreshold(self, threshold):
+        if self.proxy_interface:
+            asyncio.create_task(self.proxy_interface.call_set_charge_start_threshold(threshold))
+
+    @pyqtSlot(int)
+    def setChargeEndThreshold(self, threshold):
+        if self.proxy_interface:
+            asyncio.create_task(self.proxy_interface.call_set_charge_end_threshold(threshold))
+
+    @pyqtSlot(str)
+    def setPowerProfile(self, profile):
+        if self.proxy_interface:
+            asyncio.create_task(self.proxy_interface.call_set_active_profile(profile))
+
+
+def main():
+    app = QGuiApplication(sys.argv)
+
+    # Hier nutzen wir qasync, um die Event-Loop sauber aufzusetzen
+    # Das verhindert den RuntimeError in Python 3.10+
+    loop = QEventLoop(app)
+    asyncio.set_event_loop(loop)
+
+    engine = QQmlApplicationEngine()
+    backend = DBusBackend()
+
+    # Kontext-Eigenschaft setzen, damit Dashboard.qml auf 'dbusBackend' zugreifen kann
+    engine.rootContext().setContextProperty("dbusBackend", backend)
+
+    # QML-Datei laden (Pfad passt sich an die Installation an)
+    qml_path = os.path.join(os.path.dirname(__file__), "Dashboard.qml")
+    if not os.path.exists(qml_path):
+        qml_path = "/usr/lib/vantage-x/Dashboard.qml"
+
+    engine.load(qml_path)
+
+    if not engine.rootObjects():
+        sys.exit(-1)
+
+    # Hauptfenster sichtbar machen, sobald alles geladen ist
+    engine.rootObjects()[0].setVisible(True)
+
+    # D-Bus asynchron nach dem Start der Loop initialisieren
+    loop.create_task(backend.init_dbus())
+
+    # Sauberes Beenden bei SIGINT (Ctrl+C)
+    def ask_exit():
+        loop.stop()
+
+    for signame in ('SIGINT', 'SIGTERM'):
         try:
-            with open(path, 'w') as f:
-                f.write(str(value))
-            return True
-        except (FileNotFoundError, PermissionError):
-            return False
+            loop.add_signal_handler(getattr(signal, signame), ask_exit)
+        except NotImplementedError:
+            pass # Falls auf Windows, aber wir sind auf Arch
 
-    @method()
-    def GetChargeStartThreshold(self) -> 'i':
-        bat_path = self._get_battery_path()
-        if bat_path:
-            return self._read_sysfs_int(os.path.join(bat_path, 'charge_control_start_threshold'))
-        return -1
+    with loop:
+        loop.run_forever()
 
-    @method()
-    def SetChargeStartThreshold(self, threshold: 'i'):
-        bat_path = self._get_battery_path()
-        if bat_path:
-            self._write_sysfs_int(os.path.join(bat_path, 'charge_control_start_threshold'), threshold)
-
-    @method()
-    def GetChargeEndThreshold(self) -> 'i':
-        bat_path = self._get_battery_path()
-        if bat_path:
-            return self._read_sysfs_int(os.path.join(bat_path, 'charge_control_end_threshold'))
-        return -1
-
-    @method()
-    def SetChargeEndThreshold(self, threshold: 'i'):
-        bat_path = self._get_battery_path()
-        if bat_path:
-            self._write_sysfs_int(os.path.join(bat_path, 'charge_control_end_threshold'), threshold)
-
-    @method()
-    def GetPenPercentage(self) -> 'i':
-        # Dynamic discovery for ThinkPad Pen
-        globs = [
-            '/sys/class/power_supply/hid-openzen*-battery/',
-            '/sys/class/power_supply/wacom_battery_*/',
-            '/sys/class/power_supply/hid-*-battery/'
-        ]
-        for pattern in globs:
-            paths = glob.glob(pattern)
-            for path in paths:
-                capacity_file = os.path.join(path, 'capacity')
-                val = self._read_sysfs_int(capacity_file)
-                if val >= 0:
-                    return val
-        return -1
-
-    # D-Bus proxy for Power Profiles
-    async def _get_power_profiles_proxy(self):
-        bus = await MessageBus(bus_type=evdev.ecodes.EV_SW).connect() # Actually we use system bus for all
-        return None # We will do proxy directly via dbus_next Message
-
-    @method()
-    async def GetActiveProfile(self) -> 's':
-        bus = await MessageBus(bus_type=0).connect() # system bus
-        msg = Message(destination='net.hadess.PowerProfiles',
-                      path='/net/hadess/PowerProfiles',
-                      interface='org.freedesktop.DBus.Properties',
-                      member='Get',
-                      signature='ss',
-                      body=['net.hadess.PowerProfiles', 'ActiveProfile'])
-        reply = await bus.call(msg)
-        bus.disconnect()
-        if reply and reply.message_type == MessageType.METHOD_RETURN:
-            return reply.body[0].value
-        return "balanced"
-
-    @method()
-    async def SetActiveProfile(self, profile: 's'):
-        bus = await MessageBus(bus_type=0).connect() # system bus
-        # Create a variant object for the dbus property
-        from dbus_next.signature import Variant
-        msg = Message(destination='net.hadess.PowerProfiles',
-                      path='/net/hadess/PowerProfiles',
-                      interface='org.freedesktop.DBus.Properties',
-                      member='Set',
-                      signature='ssv',
-                      body=['net.hadess.PowerProfiles', 'ActiveProfile', Variant('s', profile)])
-        await bus.call(msg)
-        bus.disconnect()
-        self.PowerProfileChanged(profile)
-
-    @method()
-    def ScanMiracast(self) -> 'as':
-        # Stub
-        return []
-
-    @method()
-    def ConnectMiracast(self, target_mac: 's') -> 'b':
-        # Stub
-        return False
-
-    @dbus_signal()
-    def PenPercentageChanged(self, percentage: 'i') -> 'i':
-        return percentage
-
-    @dbus_signal()
-    def PowerProfileChanged(self, profile: 's') -> 's':
-        return profile
-
-    @dbus_signal()
-    def TabletModeChanged(self, is_tablet_mode: 'b') -> 'b':
-        return is_tablet_mode
-
-    # Input Management for Tablet Mode
-    def update_grabs(self):
-        if self.tablet_mode:
-            # Grab keyboard and touchpad
-            for device in [evdev.InputDevice(path) for path in evdev.list_devices()]:
-                if "keyboard" in device.name.lower() or "touchpad" in device.name.lower():
-                    try:
-                        device.grab()
-                        self.grabbed_devices.append(device)
-                        print(f"Grabbed {device.name}")
-                    except IOError:
-                        pass
-        else:
-            # Release grabs
-            for device in self.grabbed_devices:
-                try:
-                    device.ungrab()
-                    print(f"Released {device.name}")
-                except IOError:
-                    pass
-            self.grabbed_devices = []
-
-    async def monitor_tablet_mode(self):
-        # Find device with SW_TABLET_MODE
-        tablet_dev = None
-        for path in evdev.list_devices():
-            dev = evdev.InputDevice(path)
-            if ecodes.EV_SW in dev.capabilities():
-                if ecodes.SW_TABLET_MODE in dev.capabilities()[ecodes.EV_SW]:
-                    tablet_dev = dev
-                    break
-        
-        if not tablet_dev:
-            print("No tablet mode switch found.")
-            return
-
-        print(f"Monitoring tablet mode on {tablet_dev.name}")
-        
-        # Initial state
-        state = tablet_dev.switch().get(ecodes.SW_TABLET_MODE, 0)
-        self.tablet_mode = bool(state)
-        self.update_grabs()
-
-        async for event in tablet_dev.async_read_loop():
-            if event.type == ecodes.EV_SW and event.code == ecodes.SW_TABLET_MODE:
-                self.tablet_mode = bool(event.value)
-                print(f"Tablet mode changed to: {self.tablet_mode}")
-                self.update_grabs()
-                self.TabletModeChanged(self.tablet_mode)
-
-    async def pen_monitor_loop(self):
-        last_val = -1
-        while True:
-            val = self.GetPenPercentage()
-            if val != last_val and val >= 0:
-                self.PenPercentageChanged(val)
-                last_val = val
-            await asyncio.sleep(10)
-
-async def main():
-    bus = await MessageBus(bus_type=0).connect() # System bus
-    daemon = VantageXDaemon('org.vantagex.daemon')
-    bus.export('/org/vantagex/daemon', daemon)
-    await bus.request_name('org.vantagex.daemon')
-    print("Vantage-X Daemon running on System D-Bus")
-
-    # Start background monitors
-    asyncio.create_task(daemon.monitor_tablet_mode())
-    asyncio.create_task(daemon.pen_monitor_loop())
-
-    # Keep alive
-    await asyncio.Future()
-
-if __name__ == '__main__':
-    # Ensure clean exit
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: loop.stop())
-    try:
-        loop.run_until_complete(main())
-    except asyncio.CancelledError:
-        pass
+if __name__ == "__main__":
+    import os
+    main()
